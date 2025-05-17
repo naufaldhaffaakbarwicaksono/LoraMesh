@@ -14,6 +14,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SX126x-Arduino.h>
+#include "LZ77.h"    // Include the LZ77 compression library
+#include "RS_FEC.h"  // Include the Reed-Solomon FEC library
 
 // OLED display settings
 #define SCREEN_WIDTH 128
@@ -72,6 +74,16 @@ int I2C_SCL = 15;          // OLED SCL
 #define QOS_RELIABLE   0x40
 #define QOS_PRIORITY   0x80
 
+// Compression and FEC flags (in extFlags)
+#define COMP_NONE        0x00
+#define COMP_LZ77        0x01
+#define COMP_DELTA       0x02
+#define COMP_LZ77_DELTA  0x03
+
+#define FEC_NONE         0x00
+#define FEC_RS           0x10  // Reed-Solomon FEC
+#define FEC_MASK         0xF0  // Mask for FEC bits
+
 // Packet structure (6-byte header plus variable payload)
 typedef struct {
   uint8_t flags;        // Bitfields for packet type, QoS, control flags
@@ -123,6 +135,10 @@ uint32_t lastRouteUpdate = 0;
 uint32_t displayUpdateTime = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL = 2000; // Update display every 2 seconds
 
+// Network statistics
+uint16_t errorsCorrected = 0;      // Number of errors corrected by FEC
+uint16_t packetsWithErrors = 0;    // Number of packets with uncorrectable errors
+
 // Data structures for the mesh protocol
 NeighborEntry neighbors[MAX_NEIGHBORS];
 RouteEntry routes[MAX_ROUTES];
@@ -134,6 +150,10 @@ uint16_t messagesProcessed = 0;
 uint16_t messagesForwarded = 0;
 uint16_t messagesDropped = 0;
 uint8_t networkDensity = 0; // Estimated network density
+
+// Compression and FEC instances
+LZ77 compressor;
+RS_FEC rs_fec;
 
 // Event handling system (based on your working example)
 #define NO_EVENT 0b0000000000000000
@@ -167,11 +187,11 @@ int8_t rcvSnr = 0;
 bool tx_cadResult;
 
 // Protocol coefficients for the DVPA routing algorithm
-float alpha = 0.4; // Weight for link quality
-float beta = 0.3;  // Weight for hop count
-float gamma = 0.1; // Weight for energy status
-float delta = 0.1; // Weight for historical reliability
-float epsilon = 0.1; // Weight for estimated transmission time
+float alpha = 0.4;          // Weight for link quality
+float beta = 0.3;           // Weight for hop count
+float energyWeight = 0.1;   // Weight for energy status (renamed from gamma)
+float delta = 0.1;          // Weight for historical reliability
+float epsilon = 0.1;        // Weight for estimated transmission time
 
 // Forward declarations
 void OnTxDone(void);
@@ -186,13 +206,10 @@ void updateRoutingTable(uint16_t nodeID, uint8_t linkQuality, uint8_t energyStat
 void sendBeacon(void);
 void sendRouteUpdate(bool triggered);
 void sendData(uint16_t destID, uint8_t *data, uint8_t length, uint8_t qos);
-void maintainNeighborTable(void);
-void displayNetworkStatus(void);
-void setupLoRaHardware(void);
-void updateOLED(void);
-void performCadBeforeSend(void);
-uint8_t compressData(uint8_t *input, uint8_t length, uint8_t *output);
-uint8_t decompressData(uint8_t *input, uint8_t length, uint8_t *output);
+uint8_t compressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t &compressionType);
+uint8_t decompressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t compressionType);
+uint8_t applyFEC(uint8_t *input, uint8_t length, uint8_t *output, uint8_t fecType);
+int8_t correctFEC(uint8_t *data, uint8_t length, uint8_t fecType);
 
 void setup() {
   // Initialize Serial Monitor
@@ -247,6 +264,7 @@ void setup() {
   Radio.Rx(RX_TIMEOUT_VALUE);
   
   Serial.println("Node initialized with ID: 0x" + String(NODE_ID, HEX));
+  Serial.println("Current time: 2025-05-17 07:19:04 UTC");
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("Node ID: 0x" + String(NODE_ID, HEX));
@@ -254,74 +272,70 @@ void setup() {
   display.display();
   
   // Schedule first beacon
-  lastBeaconTime = millis() - (beaconInterval - random(5000));
-  displayUpdateTime = millis();
+  lastBeaconTime = millis() - beaconInterval + random(5000);
 }
 
 void loop() {
-  // Wait until semaphore is released
-  xSemaphoreTake(g_task_sem, portMAX_DELAY);
-
-  // Handle event
-  while (g_task_event_type != NO_EVENT) {
-    if ((g_task_event_type & TX_FIN) == TX_FIN) {
-      g_task_event_type &= N_TX_FIN;
-      Serial.println("TX Done");
+  // Blocked by semaphores until events occur
+  // Will wake up for scheduled tasks (beacons, etc.)
+  if(xSemaphoreTake(g_task_sem, 1000) == pdTRUE) {
+    // Event occurred, check the event type
+    uint16_t event = g_task_event_type;
+    
+    // Clear the event type
+    g_task_event_type = NO_EVENT;
+    
+    // Handle the event based on the type
+    if(event & TX_FIN) {
+      Serial.println("TX done");
       
-      // After sending, listen for responses
-      Radio.Sleep();
+      // After sending, go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
     
-    if ((g_task_event_type & TX_ERR) == TX_ERR) {
-      g_task_event_type &= N_TX_ERR;
-      Serial.println("TX Timeout");
+    if(event & TX_ERR) {
+      Serial.println("TX timeout");
       
-      // If message failed to send, return to listening
-      Radio.Sleep();
+      // After sending, go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
     
-    if ((g_task_event_type & RX_FIN) == RX_FIN) {
-      g_task_event_type &= N_RX_FIN;
-      Serial.println("RX Done");
-      
+    if(event & RX_FIN) {
       // Process the received packet
       processReceivedPacket(rcvBuffer, rcvSize, rcvRssi, rcvSnr);
       
-      // Return to listening
-      Radio.Sleep();
+      // Go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
     
-    if ((g_task_event_type & RX_ERR) == RX_ERR) {
-      g_task_event_type &= N_RX_ERR;
-      Serial.println("RX Error/Timeout");
+    if(event & RX_ERR) {
+      Serial.println("RX error");
       
-      // Return to listening
-      Radio.Sleep();
+      // Go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
     
-    if ((g_task_event_type & CAD_FIN) == CAD_FIN) {
-      g_task_event_type &= N_CAD_FIN;
-      
-      if (tx_cadResult) {
-        Serial.println("Channel busy, delaying transmission");
-        // Wait and try again
-        delay(random(200, 500));
-        performCadBeforeSend();
+    if(event & CAD_FIN) {
+      if(tx_cadResult) {
+        // Channel is clear, proceed with transmission
+        Radio.Tx(TX_TIMEOUT_VALUE);
       } else {
-        Serial.println("Channel free, sending message");
-        // Channel is free, proceed with transmission
-        // The actual transmission will be handled by the calling function
-        // which set up the CAD operation
+        // Channel is busy, wait a random time and try again
+        Serial.println("Channel busy, delaying transmission");
+        delay(random(100, 500));
+        
+        // Go back to listening for now
+        Radio.Rx(RX_TIMEOUT_VALUE);
       }
     }
   }
   
-  // Current time
+  // Check if it's time to update the display
   uint32_t currentTime = millis();
+  if(currentTime - displayUpdateTime >= DISPLAY_UPDATE_INTERVAL) {
+    updateOLED();
+    displayUpdateTime = currentTime;
+  }
   
   // Check if it's time to send a beacon
   if(currentTime - lastBeaconTime >= beaconInterval) {
@@ -329,8 +343,8 @@ void loop() {
     lastBeaconTime = currentTime;
     
     // Implement Trickle algorithm for beacon interval
-    if(beaconInterval < BEACON_INTERVAL_MAX * 1000) {
-      beaconInterval = min(beaconInterval * 2, BEACON_INTERVAL_MAX * 1000);
+    if(beaconInterval < (uint32_t)(BEACON_INTERVAL_MAX * 1000)) {
+      beaconInterval = min(beaconInterval * 2, (uint32_t)(BEACON_INTERVAL_MAX * 1000));
     }
   }
   
@@ -350,36 +364,35 @@ void loop() {
       if(currentTime - messageBuffer[i].timestamp > 30000) { // 30 seconds
         messageBuffer[i].active = false;
         messagesDropped++;
-        continue;
+        Serial.printf("Message expired after %d attempts\n", messageBuffer[i].attempts);
       }
       
-      // If critical message needs retry
-      if((messageBuffer[i].packet.flags & QOS_CRITICAL) && 
-         messageBuffer[i].attempts < 3 && 
-         currentTime - messageBuffer[i].timestamp > 5000) { // Retry every 5 seconds
+      // If message needs retry (reliable delivery)
+      else if((messageBuffer[i].packet.flags & QOS_RELIABLE) && 
+             messageBuffer[i].attempts < 3 &&
+             currentTime - messageBuffer[i].timestamp > 5000) { // 5 second retry
         
-        // Retry sending the message
-        MeshPacket *packet = &messageBuffer[i].packet;
+        Serial.printf("Retrying message delivery, attempt %d\n", messageBuffer[i].attempts + 1);
+        
         messageBuffer[i].attempts++;
         messageBuffer[i].timestamp = currentTime;
         
-        // Check if channel is clear before sending
         performCadBeforeSend();
-        
-        // The actual send will be handled in the CAD callback
-        Radio.Send((uint8_t*)packet, packet->length + 8); // 6 bytes header + 2 bytes extra fields
+        Radio.Send((uint8_t*)&messageBuffer[i].packet, messageBuffer[i].packet.length + 8);
       }
     }
-  }
-  
-  // Update display periodically
-  if(currentTime - displayUpdateTime > DISPLAY_UPDATE_INTERVAL) {
-    updateOLED();
-    displayUpdateTime = currentTime;
   }
 }
 
 void setupLoRaHardware() {
+  // Set up radio events
+  RadioEvents.TxDone = OnTxDone;
+  RadioEvents.RxDone = OnRxDone;
+  RadioEvents.TxTimeout = OnTxTimeout;
+  RadioEvents.RxTimeout = OnRxTimeout;
+  RadioEvents.RxError = OnRxError;
+  RadioEvents.CadDone = OnCadDone;
+  
   // Set up hardware configuration based on your working configuration
   hwConfig.CHIP_TYPE = SX1262_CHIP;       // Using an SX1262 module
   hwConfig.PIN_LORA_RESET = PIN_LORA_RESET;
@@ -394,32 +407,12 @@ void setupLoRaHardware() {
   hwConfig.USE_DIO2_ANT_SWITCH = false;
   hwConfig.USE_DIO3_TCXO = false;
   hwConfig.USE_DIO3_ANT_SWITCH = false;
-  hwConfig.USE_RXEN_ANT_PWR = true; // Important flag from your working code
-  
-  // Initialize the LoRa hardware
-  uint32_t init_result = lora_hardware_init(hwConfig);
-  Serial.printf("LoRa init %s\r\n", init_result == 0 ? "success" : "failed");
-  
-  if (init_result != 0) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("LoRa init failed!");
-    display.display();
-    while(1); // Stop if initialization failed
-  }
-  
-  // Setup event handlers
-  RadioEvents.TxDone = OnTxDone;
-  RadioEvents.RxDone = OnRxDone;
-  RadioEvents.TxTimeout = OnTxTimeout;
-  RadioEvents.RxTimeout = OnRxTimeout;
-  RadioEvents.RxError = OnRxError;
-  RadioEvents.CadDone = OnCadDone;
   
   // Initialize the radio
-  Radio.Init(&RadioEvents);
+  Serial.println("Initializing SX1262 radio with hardware configuration...");
+  Radio.Init(&RadioEvents, &hwConfig);
   
-  // Configure radio parameters
+  // Configure the radio
   Radio.SetChannel(RF_FREQUENCY);
   
   // Configure transmitter
@@ -447,7 +440,8 @@ void OnTxDone(void) {
 }
 
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
-  // Store the received packet data
+  // Copy the received data to the buffer for processing
+  // in the main task
   memcpy(rcvBuffer, payload, size);
   rcvSize = size;
   rcvRssi = rssi;
@@ -497,6 +491,20 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
   Serial.printf("Received packet type %d from 0x%04X to 0x%04X\n", 
                packetType, sourceID, destID);
   
+  // Check if FEC is applied and try to correct errors if present
+  uint8_t fecType = packet->extFlags & FEC_MASK;
+  if(fecType != FEC_NONE) {
+    int8_t corrected = correctFEC(packet->payload, packet->length, fecType);
+    if(corrected > 0) {
+      Serial.printf("FEC corrected %d errors in packet\n", corrected);
+      errorsCorrected += corrected;
+    } else if(corrected < 0) {
+      Serial.println("Packet has uncorrectable errors");
+      packetsWithErrors++;
+      // We might still try to process it, but it's likely corrupted
+    }
+  }
+  
   // Update neighbor information based on received packet
   int neighborIndex = -1;
   for(int i = 0; i < MAX_NEIGHBORS; i++) {
@@ -538,7 +546,7 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
   
   // Process the packet based on its type
   switch(packetType) {
-    case PKT_TYPE_DATA:
+    case PKT_TYPE_DATA: {
       // Check if the packet is for us
       if(destID == NODE_ID || destID == 0xFFFF) {
         Serial.printf("Received data packet from 0x%04X\n", sourceID);
@@ -560,12 +568,27 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
           Radio.Send((uint8_t*)&ackPacket, 6);  // Send header only
         }
         
-        // Process the actual payload data here
-        Serial.print("Data: ");
-        for(int i = 0; i < min(packet->length, 16); i++) {
-          Serial.printf("%02X ", packet->payload[i]);
+        // Process payload based on compression and FEC flags
+        uint8_t compressionType = packet->extFlags & 0x0F;
+        
+        if(compressionType != COMP_NONE) {
+          uint8_t decompressedData[240];
+          uint8_t decompressedLength = decompressData(packet->payload, packet->length, decompressedData, compressionType);
+          
+          // Process the decompressed data
+          Serial.print("Decompressed Data: ");
+          for(int i = 0; i < min((int)decompressedLength, 16); i++) {
+            Serial.printf("%02X ", decompressedData[i]);
+          }
+          Serial.println();
+        } else {
+          // Process the actual payload data here (no compression)
+          Serial.print("Data: ");
+          for(int i = 0; i < min((int)packet->length, 16); i++) {
+            Serial.printf("%02X ", packet->payload[i]);
+          }
+          Serial.println();
         }
-        Serial.println();
         
         messagesProcessed++;
       }
@@ -611,8 +634,9 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
         }
       }
       break;
+    }
       
-    case PKT_TYPE_BEACON:
+    case PKT_TYPE_BEACON: {
       // Process beacon - update neighbor table, reset beacon interval if network changed
       Serial.printf("Received beacon from 0x%04X\n", sourceID);
       
@@ -622,8 +646,9 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
         lastBeaconTime = millis() - (beaconInterval - random(5000));
       }
       break;
+    }
       
-    case PKT_TYPE_ROUTE_UPD:
+    case PKT_TYPE_ROUTE_UPD: {
       // Process route update - extract routing information
       Serial.printf("Received route update from 0x%04X\n", sourceID);
       
@@ -645,8 +670,9 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
         }
       }
       break;
+    }
       
-    case PKT_TYPE_JOIN_REQ:
+    case PKT_TYPE_JOIN_REQ: {
       // Handle join request - respond if we have capacity
       Serial.printf("Received join request from 0x%04X\n", sourceID);
       
@@ -678,16 +704,18 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
         Radio.Send((uint8_t*)&joinResp, 8);
       }
       break;
+    }
       
-    case PKT_TYPE_JOIN_RESP:
+    case PKT_TYPE_JOIN_RESP: {
       // Handle join response - evaluate for potential neighbor selection
       Serial.printf("Received join response from 0x%04X\n", sourceID);
       
       // This would be processed during the active joining phase
       // For now, we just update the neighbor table
       break;
+    }
       
-    case PKT_TYPE_ACK:
+    case PKT_TYPE_ACK: {
       // Handle acknowledgment - clear message from buffer if present
       Serial.printf("Received ACK from 0x%04X\n", sourceID);
       
@@ -703,10 +731,12 @@ void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t
         }
       }
       break;
+    }
       
-    default:
+    default: {
       Serial.printf("Unknown packet type: %d\n", packetType);
       break;
+    }
   }
 }
 
@@ -774,8 +804,18 @@ void sendRouteUpdate(bool triggered) {
   
   routeUpdate.length = offset;
   
+  // Route updates are important, so apply FEC
+  uint8_t fecBuffer[240];
+  uint8_t fecLength = applyFEC(routeUpdate.payload, routeUpdate.length, fecBuffer, FEC_RS);
+  
+  if(fecLength > 0) {
+    memcpy(routeUpdate.payload, fecBuffer, fecLength);
+    routeUpdate.length = fecLength;
+    routeUpdate.extFlags |= FEC_RS;
+  }
+  
   performCadBeforeSend();
-  Radio.Send((uint8_t*)&routeUpdate, offset + 6);
+  Radio.Send((uint8_t*)&routeUpdate, routeUpdate.length + 8); // 8 is header size
 }
 
 void sendData(uint16_t destID, uint8_t *data, uint8_t length, uint8_t qos) {
@@ -801,22 +841,79 @@ void sendData(uint16_t destID, uint8_t *data, uint8_t length, uint8_t qos) {
   dataPacket.destID = destID;
   dataPacket.seqNum = currentSeqNum++;
   dataPacket.ttl = 10; // Example TTL value
+  dataPacket.extFlags = 0; // Start with no compression or FEC
   
-  // Check if compression would be beneficial
-  uint8_t compressedData[240];
-  uint8_t compressedLength = compressData(data, length, compressedData);
+  // Step 1: Try to compress the data first
+  uint8_t tempBuffer[240];
+  uint8_t compressionType = COMP_NONE;
   
-  if(compressedLength < length) {
-    // Use compressed data
-    memcpy(dataPacket.payload, compressedData, compressedLength);
+  uint8_t compressedLength = compressData(data, length, tempBuffer, compressionType);
+  
+  // Step 2: Determine if we should apply FEC based on QoS
+  uint8_t fecType = FEC_NONE;
+  
+  // Apply FEC for CRITICAL or PRIORITY messages, or for links with low quality
+  if(qos & (QOS_CRITICAL | QOS_PRIORITY) || 
+     (routeIndex != -1 && routes[routeIndex].linkQuality < 150)) {
+    fecType = FEC_RS;
+  }
+  
+  // Step 3: Apply FEC if needed
+  uint8_t finalBuffer[240];
+  uint8_t finalLength = 0;
+  
+  if(fecType != FEC_NONE && compressedLength < length) {
+    // Apply FEC to compressed data
+    finalLength = applyFEC(tempBuffer, compressedLength, finalBuffer, fecType);
+    
+    if(finalLength > 0 && finalLength < length) {
+      memcpy(dataPacket.payload, finalBuffer, finalLength);
+      dataPacket.length = finalLength;
+      dataPacket.extFlags = compressionType | fecType;
+      
+      Serial.printf("Applied compression (%d) and FEC (%d): %d -> %d -> %d bytes\n", 
+                   compressionType, fecType, length, compressedLength, finalLength);
+    } else {
+      // FEC added too much overhead, use just compression
+      memcpy(dataPacket.payload, tempBuffer, compressedLength);
+      dataPacket.length = compressedLength;
+      dataPacket.extFlags = compressionType;
+      
+      Serial.printf("Applied compression only (%d): %d -> %d bytes\n", 
+                   compressionType, length, compressedLength);
+    }
+  } else if(compressedLength < length) {
+    // Use compressed data without FEC
+    memcpy(dataPacket.payload, tempBuffer, compressedLength);
     dataPacket.length = compressedLength;
-    // Set compression flag
-    dataPacket.extFlags = 0x01;
+    dataPacket.extFlags = compressionType;
+    
+    Serial.printf("Applied compression only (%d): %d -> %d bytes\n", 
+                 compressionType, length, compressedLength);
+  } else if(fecType != FEC_NONE) {
+    // Apply FEC to original data
+    finalLength = applyFEC(data, length, finalBuffer, fecType);
+    
+    if(finalLength > 0 && finalLength < length * 1.5) { // Allow some overhead for FEC
+      memcpy(dataPacket.payload, finalBuffer, finalLength);
+      dataPacket.length = finalLength;
+      dataPacket.extFlags = fecType;
+      
+      Serial.printf("Applied FEC only (%d): %d -> %d bytes\n", 
+                   fecType, length, finalLength);
+    } else {
+      // FEC adds too much overhead, use original data
+      memcpy(dataPacket.payload, data, length);
+      dataPacket.length = length;
+      
+      Serial.printf("Using original data: %d bytes\n", length);
+    }
   } else {
     // Use original data
     memcpy(dataPacket.payload, data, length);
     dataPacket.length = length;
-    dataPacket.extFlags = 0x00;
+    
+    Serial.printf("Using original data: %d bytes\n", length);
   }
   
   // Store in message buffer if reliable delivery is requested
@@ -833,7 +930,107 @@ void sendData(uint16_t destID, uint8_t *data, uint8_t length, uint8_t qos) {
   }
   
   performCadBeforeSend();
-  Radio.Send((uint8_t*)&dataPacket, dataPacket.length + 8); // 6 bytes header + 2 bytes extra fields
+  Radio.Send((uint8_t*)&dataPacket, dataPacket.length + 8); // 8 bytes header + ext fields
+}
+
+// Advanced compression using LZ77
+uint8_t compressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t &compressionType) {
+  uint8_t tempBuffer[240];
+  uint16_t lz77Result, deltaResult, combinedResult;
+  
+  // Try standard LZ77 compression
+  lz77Result = compressor.compress(input, length, output, 240);
+  
+  // Try delta encoding (good for sensor data)
+  deltaResult = compressor.deltaEncode(input, length, tempBuffer, 240);
+  
+  // Try combined approach: delta encode first, then LZ77 compress
+  if(deltaResult > 0 && deltaResult < length) {
+    combinedResult = compressor.compress(tempBuffer, deltaResult, output, 240);
+    
+    // Choose best compression method
+    if(combinedResult > 0 && combinedResult < length && combinedResult < lz77Result) {
+      compressionType = COMP_LZ77_DELTA;
+      return combinedResult;
+    }
+  }
+  
+  // If delta encoding alone is best
+  if(deltaResult > 0 && deltaResult < length && 
+     (lz77Result == 0 || deltaResult < lz77Result)) {
+    memcpy(output, tempBuffer, deltaResult);
+    compressionType = COMP_DELTA;
+    return deltaResult;
+  }
+  
+  // If LZ77 compression provided benefit
+  if(lz77Result > 0 && lz77Result < length) {
+    compressionType = COMP_LZ77;
+    return lz77Result;
+  }
+  
+  // Fallback - no compression
+  compressionType = COMP_NONE;
+  return length + 1; // Signal that compression isn't worth it
+}
+
+uint8_t decompressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t compressionType) {
+  uint8_t tempBuffer[240];
+  uint16_t result = 0;
+  
+  switch(compressionType) {
+    case COMP_LZ77:
+      // Simple LZ77 decompression
+      result = compressor.decompress(input, length, output, 240);
+      break;
+      
+    case COMP_DELTA:
+      // Delta decoding
+      result = compressor.deltaDecode(input, length, output, 240);
+      break;
+      
+    case COMP_LZ77_DELTA:
+      // Combined approach: first LZ77 decompress, then delta decode
+      result = compressor.decompress(input, length, tempBuffer, 240);
+      if(result > 0) {
+        result = compressor.deltaDecode(tempBuffer, result, output, 240);
+      }
+      break;
+      
+    default:
+      // No compression, just copy
+      memcpy(output, input, length);
+      result = length;
+      break;
+  }
+  
+  return result;
+}
+
+// Apply FEC to data
+uint8_t applyFEC(uint8_t *input, uint8_t length, uint8_t *output, uint8_t fecType) {
+  switch(fecType) {
+    case FEC_RS:
+      return rs_fec.encode(input, length, output);
+      
+    default:
+      // No FEC, just copy
+      memcpy(output, input, length);
+      return length;
+  }
+}
+
+// Correct errors using FEC
+// Returns number of corrected errors, or -1 if uncorrectable
+int8_t correctFEC(uint8_t *data, uint8_t length, uint8_t fecType) {
+  switch(fecType) {
+    case FEC_RS:
+      return rs_fec.decode(data, length);
+      
+    default:
+      // No FEC
+      return 0;
+  }
 }
 
 void maintainNeighborTable() {
@@ -907,19 +1104,19 @@ void updateRoutingTable(uint16_t nodeID, uint8_t linkQuality, uint8_t energyStat
 
 float calculateCompositMetric(uint8_t linkQuality, uint8_t hopCount, uint8_t energyStatus, uint16_t reliability, uint8_t etx) {
   // Normalize input values to 0-1 range
-  float normalizedLQ = linkQuality / 255.0;
-  float normalizedES = energyStatus / 255.0;
-  float normalizedHR = reliability / 1000.0;
+  float normalizedLQ = linkQuality / 255.0f;
+  float normalizedES = energyStatus / 255.0f;
+  float normalizedHR = reliability / 1000.0f;
   
   // Apply the DVPA formula:
   // CM = α×(1/LQ) + β×HC + γ×(1/ES) + δ×(1/HR) + ε×ETX
   
   float metric = 
-    alpha * (1.0 / max(normalizedLQ, 0.01)) + 
-    beta * hopCount + 
-    gamma * (1.0 / max(normalizedES, 0.01)) + 
-    delta * (1.0 / max(normalizedHR, 0.01)) + 
-    epsilon * etx;
+    alpha * (1.0f / max(normalizedLQ, 0.01f)) + 
+    beta * (float)hopCount + 
+    energyWeight * (1.0f / max(normalizedES, 0.01f)) + 
+    delta * (1.0f / max(normalizedHR, 0.01f)) + 
+    epsilon * (float)etx;
   
   return metric;
 }
@@ -949,7 +1146,7 @@ void updateOLED() {
   display.printf("Neighbors: %d\n", activeNeighbors);
   display.printf("Routes: %d\n", activeRoutes);
   display.printf("Msgs: %d/%d/%d\n", messagesProcessed, messagesForwarded, messagesDropped);
-  display.printf("Beacon: %ds\n", (beaconInterval / 1000));
+  display.printf("FEC: %d/%d\n", errorsCorrected, packetsWithErrors);
   
   display.display();
 }
@@ -959,59 +1156,4 @@ void performCadBeforeSend() {
   Radio.SetCadParams(LORA_CAD_08_SYMBOL, LORA_SPREADING_FACTOR + 13, 10, LORA_CAD_ONLY, 0);
   Radio.StartCad();
   // The CAD callback will handle what happens next
-}
-
-// Simplified compression implementation
-uint8_t compressData(uint8_t *input, uint8_t length, uint8_t *output) {
-  // Simple run-length encoding
-  uint8_t outIndex = 0;
-  uint8_t inIndex = 0;
-  
-  while(inIndex < length) {
-    uint8_t currentByte = input[inIndex];
-    uint8_t runLength = 1;
-    
-    while(inIndex + runLength < length && input[inIndex + runLength] == currentByte && runLength < 255) {
-      runLength++;
-    }
-    
-    if(runLength > 3) { // Only compress runs of 4 or more
-      output[outIndex++] = 0;  // Marker for compressed run
-      output[outIndex++] = currentByte;
-      output[outIndex++] = runLength;
-      inIndex += runLength;
-    } else {
-      output[outIndex++] = 1;  // Marker for literal byte
-      output[outIndex++] = currentByte;
-      inIndex++;
-    }
-    
-    if(outIndex >= length - 2) { // If compression isn't helping, abort
-      return length + 1;  // Return original length + 1 to signal no compression benefit
-    }
-  }
-  
-  return outIndex;
-}
-
-uint8_t decompressData(uint8_t *input, uint8_t length, uint8_t *output) {
-  uint8_t outIndex = 0;
-  uint8_t inIndex = 0;
-  
-  while(inIndex < length) {
-    uint8_t marker = input[inIndex++];
-    
-    if(marker == 0) { // Compressed run
-      uint8_t byte = input[inIndex++];
-      uint8_t runLength = input[inIndex++];
-      
-      for(int i = 0; i < runLength; i++) {
-        output[outIndex++] = byte;
-      }
-    } else { // Literal byte
-      output[outIndex++] = input[inIndex++];
-    }
-  }
-  
-  return outIndex;
 }
