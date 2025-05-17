@@ -5,7 +5,8 @@
  * Based on successfully tested hardware configuration
  * 
  * Hardware: ESP32 + SX1262 (RA-01SH) + OLED SSD1306
- * Date: 2025-05-17
+ * Date: 2025-05-17 08:03:01 UTC
+ * Author: naufaldhaffaakbarwicaksono
  ***************************************************/
 
 #include <Arduino.h>
@@ -14,8 +15,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SX126x-Arduino.h>
-#include "LZ77.h"    // Include the LZ77 compression library
-#include "RS_FEC.h"  // Include the Reed-Solomon FEC library
+#include "LZ77.h"
+#include "RS_FEC.h"
 
 // OLED display settings
 #define SCREEN_WIDTH 128
@@ -24,43 +25,41 @@
 #define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// LoRa pin configuration for ESP32 with RA-01SH sx1262
-// These match the working configuration you provided
+// LoRa & board pin configuration
 hw_config hwConfig;
-int PIN_LORA_RESET = 4;    // LORA RESET
-int PIN_LORA_NSS = 5;      // LORA SPI CS
-int PIN_LORA_SCLK = 18;    // LORA SPI CLK
-int PIN_LORA_MISO = 19;    // LORA SPI MISO 
-int PIN_LORA_MOSI = 23;    // LORA SPI MOSI
-int PIN_LORA_BUSY = 22;    // LORA SPI BUSY
-int PIN_LORA_DIO_1 = 21;   // LORA DIO_1
-int RADIO_TXEN = 26;       // LORA ANTENNA TX ENABLE
-int RADIO_RXEN = 27;       // LORA ANTENNA RX ENABLE
-int I2C_SDA = 14;          // OLED SDA
-int I2C_SCL = 15;          // OLED SCL
+int PIN_LORA_RESET = 4;
+int PIN_LORA_NSS = 5;
+int PIN_LORA_SCLK = 18;
+int PIN_LORA_MISO = 19;
+int PIN_LORA_MOSI = 23;
+int PIN_LORA_BUSY = 22;
+int PIN_LORA_DIO_1 = 21;
+int RADIO_TXEN = 26;
+int RADIO_RXEN = 27;
+int I2C_SDA = 14;
+int I2C_SCL = 15;
 
-// LoRa parameters for 915MHz operation
-#define RF_FREQUENCY  915000000  // Hz (915 MHz)
-#define TX_OUTPUT_POWER 22       // dBm (adjust based on regulatory requirements)
-#define LORA_BANDWIDTH 0         // 0: 125 kHz
-#define LORA_SPREADING_FACTOR 7  // SF7 for higher data rate
-#define LORA_CODINGRATE 1        // 4/5 coding rate
-#define LORA_PREAMBLE_LENGTH 8   // symbols
-#define LORA_SYMBOL_TIMEOUT 0    // symbols
+// LoRa parameters
+#define RF_FREQUENCY  915000000
+#define TX_OUTPUT_POWER 22
+#define LORA_BANDWIDTH 0
+#define LORA_SPREADING_FACTOR 7
+#define LORA_CODINGRATE 1
+#define LORA_PREAMBLE_LENGTH 8
+#define LORA_SYMBOL_TIMEOUT 0
 #define LORA_FIX_LENGTH_PAYLOAD_ON false
 #define LORA_IQ_INVERSION_ON false
-#define RX_TIMEOUT_VALUE 3000    // ms
-#define TX_TIMEOUT_VALUE 3000    // ms
+#define RX_TIMEOUT_VALUE 3000
+#define TX_TIMEOUT_VALUE 3000
 
-// Node identification and network parameters
-#define NODE_ID 0xABCD           // 16-bit node identifier, change for each node
-#define MAX_NEIGHBORS 32         // Maximum number of neighbors to track
-#define MAX_ROUTES 64            // Maximum number of routes to store
-#define BEACON_INTERVAL_MIN 30   // Minimum beacon interval in seconds
-#define BEACON_INTERVAL_MAX 1800 // Maximum beacon interval in seconds (30 minutes)
-#define MSG_BUFFER_SIZE 10       // Number of messages to buffer for forwarding
+// Network and protocol parameters
+#define NODE_ID 0xABCD
+#define MAX_NEIGHBORS 32
+#define MAX_ROUTES 64
+#define BEACON_INTERVAL_MIN 30
+#define BEACON_INTERVAL_MAX 1800
+#define MSG_BUFFER_SIZE 10
 
-// Protocol constants
 #define PKT_TYPE_DATA      0x01
 #define PKT_TYPE_BEACON    0x02
 #define PKT_TYPE_ROUTE_UPD 0x03
@@ -68,59 +67,53 @@ int I2C_SCL = 15;          // OLED SCL
 #define PKT_TYPE_JOIN_RESP 0x05
 #define PKT_TYPE_ACK       0x06
 
-// QoS flags
 #define QOS_NORMAL     0x00
 #define QOS_CRITICAL   0x20
 #define QOS_RELIABLE   0x40
 #define QOS_PRIORITY   0x80
 
-// Compression and FEC flags (in extFlags)
 #define COMP_NONE        0x00
 #define COMP_LZ77        0x01
 #define COMP_DELTA       0x02
 #define COMP_LZ77_DELTA  0x03
 
 #define FEC_NONE         0x00
-#define FEC_RS           0x10  // Reed-Solomon FEC
-#define FEC_MASK         0xF0  // Mask for FEC bits
+#define FEC_RS           0x10
+#define FEC_MASK         0xF0
 
-// Packet structure (6-byte header plus variable payload)
 typedef struct {
-  uint8_t flags;        // Bitfields for packet type, QoS, control flags
-  uint16_t sourceID;    // 2-byte source node ID
-  uint16_t destID;      // 2-byte destination node ID (0xFFFF for broadcast)
-  uint8_t seqNum;       // 1-byte sequence number
-  uint8_t ttl;          // Time-to-live counter (optional)
-  uint8_t extFlags;     // Extended flags for additional features (optional)
-  uint8_t payload[240]; // Variable payload (adjustable)
-  uint8_t length;       // Total length of the payload
+  uint8_t flags;
+  uint16_t sourceID;
+  uint16_t destID;
+  uint8_t seqNum;
+  uint8_t ttl;
+  uint8_t extFlags;
+  uint8_t payload[240];
+  uint8_t length;
 } MeshPacket;
 
-// Neighbor table entry (9 bytes each)
 typedef struct {
-  uint16_t nodeID;      // Node identifier
-  uint8_t linkQuality;  // Link quality metric (0-255)
-  uint32_t lastHeard;   // Last time heard from (millis)
-  uint8_t energyStatus; // Energy status (0-255, higher is better)
-  uint8_t capabilities; // Capability flags
-  bool active;          // Whether this entry is active
+  uint16_t nodeID;
+  uint8_t linkQuality;
+  uint32_t lastHeard;
+  uint8_t energyStatus;
+  uint8_t capabilities;
+  bool active;
 } NeighborEntry;
 
-// Routing table entry
 typedef struct {
-  uint16_t destID;      // Destination node ID
-  uint16_t nextHopID;   // Next hop node ID
-  uint16_t pathNodes[4]; // Partial path information (up to 4 hops)
-  uint8_t hopCount;     // Number of hops to destination
-  uint8_t linkQuality;  // Composite link quality
-  uint8_t energyMetric; // Energy-based metric
-  uint16_t reliability; // Historical reliability (0-1000)
-  uint32_t lastUpdated; // Last time route was updated
-  float compositMetric; // Calculated composite metric
-  bool active;          // Whether this entry is active
+  uint16_t destID;
+  uint16_t nextHopID;
+  uint16_t pathNodes[4];
+  uint8_t hopCount;
+  uint8_t linkQuality;
+  uint8_t energyMetric;
+  uint16_t reliability;
+  uint32_t lastUpdated;
+  float compositMetric;
+  bool active;
 } RouteEntry;
 
-// Message buffer for storing messages pending forwarding or acknowledgment
 typedef struct {
   MeshPacket packet;
   uint32_t timestamp;
@@ -128,34 +121,28 @@ typedef struct {
   bool active;
 } MessageBuffer;
 
-// Protocol timing parameters
-uint32_t beaconInterval = BEACON_INTERVAL_MIN * 1000; // in ms
+// Protocol timing and state
+uint32_t beaconInterval = BEACON_INTERVAL_MIN * 1000;
 uint32_t lastBeaconTime = 0;
 uint32_t lastRouteUpdate = 0;
 uint32_t displayUpdateTime = 0;
-const uint32_t DISPLAY_UPDATE_INTERVAL = 2000; // Update display every 2 seconds
+const uint32_t DISPLAY_UPDATE_INTERVAL = 2000;
 
-// Network statistics
-uint16_t errorsCorrected = 0;      // Number of errors corrected by FEC
-uint16_t packetsWithErrors = 0;    // Number of packets with uncorrectable errors
-
-// Data structures for the mesh protocol
+uint16_t errorsCorrected = 0;
+uint16_t packetsWithErrors = 0;
 NeighborEntry neighbors[MAX_NEIGHBORS];
 RouteEntry routes[MAX_ROUTES];
 MessageBuffer messageBuffer[MSG_BUFFER_SIZE];
-
-// Protocol state variables
 uint8_t currentSeqNum = 0;
 uint16_t messagesProcessed = 0;
 uint16_t messagesForwarded = 0;
 uint16_t messagesDropped = 0;
-uint8_t networkDensity = 0; // Estimated network density
+uint8_t networkDensity = 0;
 
-// Compression and FEC instances
 LZ77 compressor;
 RS_FEC rs_fec;
 
-// Event handling system (based on your working example)
+// Event & radio objects
 #define NO_EVENT 0b0000000000000000
 #define TX_FIN 0b0000000000000001
 #define N_TX_FIN 0b1111111111111110
@@ -168,30 +155,20 @@ RS_FEC rs_fec;
 #define CAD_FIN 0b0000000000100000
 #define N_CAD_FIN 0b1111111111011111
 
-// Semaphore used by events to wake up loop task
 SemaphoreHandle_t g_task_sem = NULL;
-
-// Flag for the event type
 volatile uint16_t g_task_event_type = NO_EVENT;
-
-// Radio events
 RadioEvents_t RadioEvents;
-
-// Received packet data
 uint8_t rcvBuffer[256];
 uint16_t rcvSize = 0;
 int16_t rcvRssi = 0;
 int8_t rcvSnr = 0;
-
-// CAD result
 bool tx_cadResult;
 
-// Protocol coefficients for the DVPA routing algorithm
-float alpha = 0.4;          // Weight for link quality
-float beta = 0.3;           // Weight for hop count
-float energyWeight = 0.1;   // Weight for energy status (renamed from gamma)
-float delta = 0.1;          // Weight for historical reliability
-float epsilon = 0.1;        // Weight for estimated transmission time
+float alpha = 0.4;
+float beta = 0.3;
+float energyWeight = 0.1;
+float delta = 0.1;
+float epsilon = 0.1;
 
 // Forward declarations
 void OnTxDone(void);
@@ -210,23 +187,23 @@ uint8_t compressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t &c
 uint8_t decompressData(uint8_t *input, uint8_t length, uint8_t *output, uint8_t compressionType);
 uint8_t applyFEC(uint8_t *input, uint8_t length, uint8_t *output, uint8_t fecType);
 int8_t correctFEC(uint8_t *data, uint8_t length, uint8_t fecType);
+void updateOLED(void);
+void maintainNeighborTable(void);
+void performCadBeforeSend(void);
 
 void setup() {
-  // Initialize Serial Monitor
   Serial.begin(115200);
   delay(500);
-  
+
   Serial.println("=====================================");
   Serial.println("LoRa Mesh Network Node Initializing");
   Serial.println("=====================================");
-  
-  // Initialize OLED Display
+
   Wire.begin(I2C_SDA, I2C_SCL);
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed
+    for(;;);
   }
-  
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -234,149 +211,94 @@ void setup() {
   display.println("LoRa Mesh Node");
   display.println("Initializing...");
   display.display();
-  
-  // Initialize protocol data structures
-  for(int i = 0; i < MAX_NEIGHBORS; i++) {
-    neighbors[i].active = false;
-  }
-  
-  for(int i = 0; i < MAX_ROUTES; i++) {
-    routes[i].active = false;
-  }
-  
-  for(int i = 0; i < MSG_BUFFER_SIZE; i++) {
-    messageBuffer[i].active = false;
-  }
-  
-  // Initialize the SX1262 LoRa module with the configuration
-  // that worked for you in previous tests
+
+  for(int i = 0; i < MAX_NEIGHBORS; i++) neighbors[i].active = false;
+  for(int i = 0; i < MAX_ROUTES; i++) routes[i].active = false;
+  for(int i = 0; i < MSG_BUFFER_SIZE; i++) messageBuffer[i].active = false;
+
   setupLoRaHardware();
-  
-  // Create the task event semaphore
+
   g_task_sem = xSemaphoreCreateBinary();
-  // Initialize semaphore
   xSemaphoreGive(g_task_sem);
-  // Take the semaphore so the loop will go to sleep until an event happens
   xSemaphoreTake(g_task_sem, 10);
-  
-  // Start the passive network joining phase
-  // Listen for beacons and network activity
+
   Radio.Rx(RX_TIMEOUT_VALUE);
-  
+
   Serial.println("Node initialized with ID: 0x" + String(NODE_ID, HEX));
-  Serial.println("Current time: 2025-05-17 07:19:04 UTC");
+  Serial.println("Current time: 2025-05-17 08:03:01 UTC");
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("Node ID: 0x" + String(NODE_ID, HEX));
   display.println("Listening...");
   display.display();
-  
-  // Schedule first beacon
+
   lastBeaconTime = millis() - beaconInterval + random(5000);
 }
 
 void loop() {
-  // Blocked by semaphores until events occur
-  // Will wake up for scheduled tasks (beacons, etc.)
   if(xSemaphoreTake(g_task_sem, 1000) == pdTRUE) {
-    // Event occurred, check the event type
     uint16_t event = g_task_event_type;
-    
-    // Clear the event type
     g_task_event_type = NO_EVENT;
-    
-    // Handle the event based on the type
+
     if(event & TX_FIN) {
       Serial.println("TX done");
-      
-      // After sending, go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
-    
     if(event & TX_ERR) {
       Serial.println("TX timeout");
-      
-      // After sending, go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
-    
     if(event & RX_FIN) {
-      // Process the received packet
       processReceivedPacket(rcvBuffer, rcvSize, rcvRssi, rcvSnr);
-      
-      // Go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
-    
     if(event & RX_ERR) {
       Serial.println("RX error");
-      
-      // Go back to listening
       Radio.Rx(RX_TIMEOUT_VALUE);
     }
-    
     if(event & CAD_FIN) {
       if(tx_cadResult) {
-        // Channel is clear, proceed with transmission
-        Radio.Tx(TX_TIMEOUT_VALUE);
+        // Channel is clear, actual transmission happens in the sending functions
+        // Do not call Radio.Tx() here
+        Serial.println("Channel is clear for transmission");
       } else {
-        // Channel is busy, wait a random time and try again
         Serial.println("Channel busy, delaying transmission");
         delay(random(100, 500));
-        
-        // Go back to listening for now
         Radio.Rx(RX_TIMEOUT_VALUE);
       }
     }
   }
-  
-  // Check if it's time to update the display
+
   uint32_t currentTime = millis();
   if(currentTime - displayUpdateTime >= DISPLAY_UPDATE_INTERVAL) {
     updateOLED();
     displayUpdateTime = currentTime;
   }
-  
-  // Check if it's time to send a beacon
   if(currentTime - lastBeaconTime >= beaconInterval) {
     sendBeacon();
     lastBeaconTime = currentTime;
-    
-    // Implement Trickle algorithm for beacon interval
     if(beaconInterval < (uint32_t)(BEACON_INTERVAL_MAX * 1000)) {
       beaconInterval = min(beaconInterval * 2, (uint32_t)(BEACON_INTERVAL_MAX * 1000));
     }
   }
-  
-  // Maintenance tasks
   maintainNeighborTable();
-  
-  // Check if we should trigger route updates (on significant changes)
-  if(currentTime - lastRouteUpdate >= 5 * 60 * 1000) { // 5 minutes
-    sendRouteUpdate(false);  // Not triggered, just periodic
+  if(currentTime - lastRouteUpdate >= 5 * 60 * 1000) {
+    sendRouteUpdate(false);
     lastRouteUpdate = currentTime;
   }
-  
-  // Process message buffer (retry, expire messages)
   for(int i = 0; i < MSG_BUFFER_SIZE; i++) {
     if(messageBuffer[i].active) {
-      // If message has been buffered too long, expire it
-      if(currentTime - messageBuffer[i].timestamp > 30000) { // 30 seconds
+      if(currentTime - messageBuffer[i].timestamp > 30000) {
         messageBuffer[i].active = false;
         messagesDropped++;
         Serial.printf("Message expired after %d attempts\n", messageBuffer[i].attempts);
       }
-      
-      // If message needs retry (reliable delivery)
-      else if((messageBuffer[i].packet.flags & QOS_RELIABLE) && 
-             messageBuffer[i].attempts < 3 &&
-             currentTime - messageBuffer[i].timestamp > 5000) { // 5 second retry
-        
+      else if((messageBuffer[i].packet.flags & QOS_RELIABLE) &&
+              messageBuffer[i].attempts < 3 &&
+              currentTime - messageBuffer[i].timestamp > 5000) {
         Serial.printf("Retrying message delivery, attempt %d\n", messageBuffer[i].attempts + 1);
-        
         messageBuffer[i].attempts++;
         messageBuffer[i].timestamp = currentTime;
-        
         performCadBeforeSend();
         Radio.Send((uint8_t*)&messageBuffer[i].packet, messageBuffer[i].packet.length + 8);
       }
@@ -385,16 +307,7 @@ void loop() {
 }
 
 void setupLoRaHardware() {
-  // Set up radio events
-  RadioEvents.TxDone = OnTxDone;
-  RadioEvents.RxDone = OnRxDone;
-  RadioEvents.TxTimeout = OnTxTimeout;
-  RadioEvents.RxTimeout = OnRxTimeout;
-  RadioEvents.RxError = OnRxError;
-  RadioEvents.CadDone = OnCadDone;
-  
-  // Set up hardware configuration based on your working configuration
-  hwConfig.CHIP_TYPE = SX1262_CHIP;       // Using an SX1262 module
+  hwConfig.CHIP_TYPE = SX1262_CHIP;
   hwConfig.PIN_LORA_RESET = PIN_LORA_RESET;
   hwConfig.PIN_LORA_NSS = PIN_LORA_NSS;
   hwConfig.PIN_LORA_SCLK = PIN_LORA_SCLK;
@@ -407,29 +320,30 @@ void setupLoRaHardware() {
   hwConfig.USE_DIO2_ANT_SWITCH = false;
   hwConfig.USE_DIO3_TCXO = false;
   hwConfig.USE_DIO3_ANT_SWITCH = false;
-  
-  // Initialize the radio
+
   Serial.println("Initializing SX1262 radio with hardware configuration...");
-  Radio.Init(&RadioEvents, &hwConfig);
-  
-  // Configure the radio
+
+  // Register event handlers
+  RadioEvents.TxDone = OnTxDone;
+  RadioEvents.RxDone = OnRxDone;
+  RadioEvents.TxTimeout = OnTxTimeout;
+  RadioEvents.RxTimeout = OnRxTimeout;
+  RadioEvents.RxError = OnRxError;
+  RadioEvents.CadDone = OnCadDone;
+
+  Radio.Init(&RadioEvents);
+
   Radio.SetChannel(RF_FREQUENCY);
-  
-  // Configure transmitter
   Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
-                   LORA_SPREADING_FACTOR, LORA_CODINGRATE,
-                   LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
-                   true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_VALUE);
-  
-  // Configure receiver
+                    LORA_SPREADING_FACTOR, LORA_CODINGRATE,
+                    LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
+                    true, 0, 0, LORA_IQ_INVERSION_ON, TX_TIMEOUT_VALUE);
   Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
-                   LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
-                   LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
-                   0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
-  
-  // Set public network mode
+                    LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH,
+                    LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON,
+                    0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
   Radio.SetPublicNetwork(false);
-  
+
   Serial.println("SX1262 radio initialized successfully");
 }
 
@@ -440,13 +354,10 @@ void OnTxDone(void) {
 }
 
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
-  // Copy the received data to the buffer for processing
-  // in the main task
   memcpy(rcvBuffer, payload, size);
   rcvSize = size;
   rcvRssi = rssi;
   rcvSnr = snr;
-  
   g_task_event_type |= RX_FIN;
   xSemaphoreGive(g_task_sem);
 }
@@ -472,6 +383,7 @@ void OnCadDone(bool cadResult) {
   xSemaphoreGive(g_task_sem);
 }
 
+// Main mesh network functions implementation
 void processReceivedPacket(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
   // Ensure the packet is at least the size of our header
   if(size < 6) {
@@ -748,6 +660,8 @@ void sendBeacon() {
   beacon.sourceID = NODE_ID;
   beacon.destID = 0xFFFF; // Broadcast
   beacon.seqNum = currentSeqNum++;
+  beacon.ttl = 1; // Beacons are normally single-hop
+  beacon.extFlags = 0; // No compression or FEC for beacons
   beacon.length = 2;
   
   // Include node information in beacon
@@ -766,6 +680,8 @@ void sendRouteUpdate(bool triggered) {
   routeUpdate.sourceID = NODE_ID;
   routeUpdate.destID = 0xFFFF; // Broadcast
   routeUpdate.seqNum = currentSeqNum++;
+  routeUpdate.ttl = 2; // Route updates typically go 2 hops
+  routeUpdate.extFlags = 0; // Clear to start
   
   // Count active routes to include
   int activeRoutes = 0;
